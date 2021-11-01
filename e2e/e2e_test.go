@@ -183,7 +183,7 @@ func TestOpenClose3(t *testing.T) {
 	session := session.New("amqp://guest:guest@localhost:5672/",
 		session.WithDeclare(
 			session.Exchange{Name: "exchange_test", Kind: "topic"},
-			session.Queue{Name: "queue_test", Durable:true},
+			session.Queue{Name: "queue_test", Durable: true},
 			session.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
 	)
 	defer session.Close()

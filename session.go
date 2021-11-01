@@ -52,7 +52,12 @@ type Bind struct {
 type EventHandler func([]byte) error
 
 type Consumer struct {
-	handler EventHandler
+	Name      string
+	QueueName string
+	AutoAck   bool
+	Exclusive bool
+
+	Handler EventHandler
 	run     int32
 }
 
@@ -109,7 +114,7 @@ func New(addr string, opts ...Option) *Session {
 
 	go session.handleReconnect()
 	go session.handleReOpenChannel()
-	go session.runConsumers()
+	go session.handleConsumers()
 
 	return session
 }
@@ -292,7 +297,7 @@ func (session *Session) declare(ch *amqp.Channel) error {
 	return nil
 }
 
-func (session *Session) runConsumers() {
+func (session *Session) handleConsumers() {
 	for {
 		session.cond.L.Lock()
 		session.cond.Wait()
@@ -305,8 +310,8 @@ func (session *Session) runConsumers() {
 
 		for _, cons := range session.consumers {
 			if atomic.LoadInt32(&cons.run) == 0 && atomic.LoadInt32(&session.isReady) == 1 {
-				if err := session.runConsumer(cons); err != nil {
-					log.Printf("failed to runConsumer:%v", err)
+				if err := session.handleConsumer(cons); err != nil {
+					log.Printf("failed to handleConsumer:%v", err)
 				}
 			}
 		}
@@ -315,8 +320,8 @@ func (session *Session) runConsumers() {
 	}
 }
 
-func (session *Session) runConsumer(cons *Consumer) error {
-	deliveries, err := session.Stream()
+func (session *Session) handleConsumer(cons *Consumer) error {
+	deliveries, err := session.Stream(cons)
 	if err != nil {
 		return err
 	}
@@ -331,7 +336,7 @@ func (session *Session) runConsumer(cons *Consumer) error {
 			default:
 			}
 
-			session.handleDelivery(d, cons.handler)
+			session.handleDelivery(d, cons.Handler)
 		}
 		atomic.StoreInt32(&cons.run, 0)
 		log.Printf("Consumer closed!")
@@ -422,7 +427,7 @@ func (session *Session) UnsafePush(data []byte) error {
 // It is required to call delivery.Ack when it has been
 // successfully processed, or delivery.Nack when it fails.
 // Ignoring this will cause data to build up on the server.
-func (session *Session) Stream() (<-chan amqp.Delivery, error) {
+func (session *Session) Stream(c *Consumer) (<-chan amqp.Delivery, error) {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return nil, ErrNotConnected
 	}
@@ -430,18 +435,21 @@ func (session *Session) Stream() (<-chan amqp.Delivery, error) {
 		return nil, fmt.Errorf("Don't set queue")
 	}
 	return session.channel.Consume(
-		session.declarationSet.Queue.Name, // Queue
-		"",                                // Consumer
-		false,                             // Auto-Ack
-		false,                             // Exclusive
-		false,                             // No-local
-		false,                             // No-Wait
-		nil,                               // Args
+		c.QueueName, // Queue
+		c.Name,      // Consumer
+		c.AutoAck,   // Auto-Ack
+		c.Exclusive, // Exclusive
+		false,       // No-local
+		false,       // No-Wait
+		nil,         // Args
 	)
 }
 
 func (session *Session) Subscribe(handler func([]byte) error) error {
-	cons := &Consumer{handler: handler}
+	cons := &Consumer{
+		Handler:   handler,
+		QueueName: session.declarationSet.Queue.Name,
+	}
 
 	session.cond.L.Lock()
 	session.consumers = append(session.consumers, cons)
@@ -483,6 +491,11 @@ func (session *Session) Close() error {
 	}
 	close(session.done)
 	session.cond.Broadcast()
+	session.cond2.Broadcast()
 	log.Printf("Session closed!")
 	return nil
+}
+
+func (session *Session) ChannelClose() error {
+	return session.channel.Close()
 }
