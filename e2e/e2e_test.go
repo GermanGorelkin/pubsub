@@ -11,14 +11,13 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 
 	session "github.com/germangorelkin/rabbitmq-session"
 )
 
 var opts = &dockertest.RunOptions{
 	Repository:   "rabbitmq",
-	Tag:          "3.9",
+	Tag:          "3.9-management-alpine",
 	ExposedPorts: []string{"5672"},
 	PortBindings: map[docker.Port][]docker.PortBinding{"5672": {{HostIP: "0.0.0.0", HostPort: "5672"}}},
 }
@@ -42,21 +41,12 @@ func TestOpenClose(t *testing.T) {
 	defer pool.Purge(resource)
 	log.Printf("run container id=%s", resource.Container.ID)
 
-	// log.Println("container stoping")
-	// if err := pool.Client.StopContainer(resource.Container.ID, 0); err != nil {
-	// 	log.Printf("failed to stop container id=%s:%v", resource.Container.ID, err)
-	// }
-
-	logger, _ := zap.NewProduction()
-
-	session := session.New(session.SessionConfig{
-		ExchangeName: "exchange_test",
-		ExchangeType: "topic",
-		QueueName:    "queue_test",
-		BindingKey:   "test",
-		Addr:         "amqp://guest:guest@localhost:5672/",
-		Logger:       logger.Sugar().Named("rabbit"),
-	})
+	session := session.New("amqp://guest:guest@localhost:5672/",
+		session.WithDeclare(
+			session.Exchange{Name: "exchange_test", Kind: "topic"},
+			session.Queue{Name: "queue_test"},
+			session.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
+	)
 	defer session.Close()
 
 	numOfMsg := 100
@@ -114,16 +104,12 @@ func TestOpenClose2(t *testing.T) {
 	defer pool.Purge(resource)
 	log.Printf("run container id=%s", resource.Container.ID)
 
-	logger, _ := zap.NewProduction()
-
-	session := session.New(session.SessionConfig{
-		ExchangeName: "exchange_test",
-		ExchangeType: "topic",
-		QueueName:    "queue_test",
-		BindingKey:   "test",
-		Addr:         "amqp://guest:guest@localhost:5672/",
-		Logger:       logger.Sugar().Named("rabbit"),
-	})
+	session := session.New("amqp://guest:guest@localhost:5672/",
+		session.WithDeclare(
+			session.Exchange{Name: "exchange_test", Kind: "topic"},
+			session.Queue{Name: "queue_test"},
+			session.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
+	)
 	defer session.Close()
 
 	numOfMsg := 100
@@ -194,16 +180,12 @@ func TestOpenClose3(t *testing.T) {
 	defer pool.Purge(resource)
 	log.Printf("run container id=%s", resource.Container.ID)
 
-	logger, _ := zap.NewProduction()
-
-	session := session.New(session.SessionConfig{
-		ExchangeName: "exchange_test",
-		ExchangeType: "topic",
-		QueueName:    "queue_test",
-		BindingKey:   "test",
-		Addr:         "amqp://guest:guest@localhost:5672/",
-		Logger:       logger.Sugar().Named("rabbit"),
-	})
+	session := session.New("amqp://guest:guest@localhost:5672/",
+		session.WithDeclare(
+			session.Exchange{Name: "exchange_test", Kind: "topic"},
+			session.Queue{Name: "queue_test", Durable:true},
+			session.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
+	)
 	defer session.Close()
 
 	numOfMsg := 100

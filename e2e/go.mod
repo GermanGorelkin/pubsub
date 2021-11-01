@@ -8,7 +8,6 @@ require (
 	github.com/germangorelkin/rabbitmq-session v0.0.0-00010101000000-000000000000
 	github.com/ory/dockertest/v3 v3.8.0
 	github.com/stretchr/testify v1.7.0
-	go.uber.org/zap v1.19.1
 )
 
 require (
@@ -37,8 +36,6 @@ require (
 	github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb // indirect
 	github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415 // indirect
 	github.com/xeipuuv/gojsonschema v1.2.0 // indirect
-	go.uber.org/atomic v1.9.0 // indirect
-	go.uber.org/multierr v1.7.0 // indirect
 	golang.org/x/net v0.0.0-20211029160332-540bb53d3b2e // indirect
 	golang.org/x/sys v0.0.0-20211029165221-6e7872819dc8 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

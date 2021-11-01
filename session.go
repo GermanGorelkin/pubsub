@@ -2,12 +2,13 @@ package rabbitmq_session
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/streadway/amqp"
-	"go.uber.org/zap"
 )
 
 const (
@@ -27,6 +28,27 @@ var (
 	ErrShutdown      = errors.New("session is shutting down")
 )
 
+type Exchange struct {
+	Name       string
+	Kind       string
+	Durable    bool
+	AutoDelete bool
+	Internal   bool
+}
+
+type Queue struct {
+	Name       string
+	Durable    bool
+	AutoDelete bool
+	Exclusive  bool
+}
+
+type Bind struct {
+	QueueName    string
+	ExchangeName string
+	Key          string
+}
+
 type EventHandler func([]byte) error
 
 type Consumer struct {
@@ -34,68 +56,79 @@ type Consumer struct {
 	run     int32
 }
 
+type Option func(*Session)
+
+func WithDeclare(ex Exchange, q Queue, b Bind) Option {
+	return func(s *Session) {
+		s.declarationSet.Exchange = ex
+		s.declarationSet.Queue = q
+		s.declarationSet.Bind = b
+		s.declarationSet.isUsageDefault = true
+		s.declarationSet.isDecalre = true
+	}
+}
+
 type Session struct {
-	exchangeName string
-	exchangeType string
-	queueName    string
-	bindingKey   string
-	consumerTag  string
-	consumers    []*Consumer
-	cond         *sync.Cond
+	addr string
+
+	declarationSet struct {
+		isUsageDefault bool
+		isDecalre      bool
+		Exchange       Exchange
+		Queue          Queue
+		Bind           Bind
+	}
+
+	consumers []*Consumer
+	cond      *sync.Cond
+	cond2     *sync.Cond
 
 	connection      *amqp.Connection
 	channel         *amqp.Channel
-	done            chan bool
 	notifyConnClose chan *amqp.Error
-	// notifyChanClose chan *amqp.Error
-	notifyConfirm chan amqp.Confirmation
-	isReady       int32
-
-	logger *zap.SugaredLogger
-}
-
-type SessionConfig struct {
-	ExchangeName string
-	ExchangeType string
-	QueueName    string
-	BindingKey   string
-	Addr         string
-
-	Logger *zap.SugaredLogger
+	notifyChanClose chan *amqp.Error
+	notifyConfirm   chan amqp.Confirmation
+	done            chan bool
+	isReady         int32
 }
 
 // New creates a new Session instance, and automatically
 // attempts to connect to the server.
-func New(cfg SessionConfig) *Session {
-	session := Session{
-		exchangeName: cfg.ExchangeName,
-		exchangeType: cfg.ExchangeType,
-		queueName:    cfg.QueueName,
-		bindingKey:   cfg.BindingKey,
-		consumerTag:  "",
-		isReady:      0,
-		done:         make(chan bool),
-
-		cond: sync.NewCond(&sync.Mutex{}),
-
-		logger: cfg.Logger,
+func New(addr string, opts ...Option) *Session {
+	session := &Session{
+		addr:    addr,
+		isReady: 0,
+		done:    make(chan bool),
+		cond:    sync.NewCond(&sync.Mutex{}),
+		cond2:   sync.NewCond(&sync.Mutex{}),
 	}
-	go session.handleReconnect(cfg.Addr)
+
+	for _, opt := range opts {
+		opt(session)
+	}
+
+	go session.handleReconnect()
+	go session.handleReOpenChannel()
 	go session.runConsumers()
-	return &session
+
+	return session
+}
+
+func (session *Session) QueueDeclare(q Queue) *Session {
+	return session
 }
 
 // handleReconnect will wait for a connection error on
 // notifyConnClose, and then continuously attempt to reconnect.
-func (session *Session) handleReconnect(addr string) {
+func (session *Session) handleReconnect() {
 	for {
 		atomic.StoreInt32(&session.isReady, 0)
-		session.logger.Info("Attempting to connect")
+		log.Printf("Attempting to connect")
 
-		conn, err := session.connect(addr)
+		_, err := session.connect()
 
 		if err != nil {
-			session.logger.Info("Failed to connect. Retrying...")
+			log.Printf("Failed to connect. Retrying...")
 
 			select {
 			case <-session.done:
@@ -105,39 +138,65 @@ func (session *Session) handleReconnect(addr string) {
 			continue
 		}
 
-		if done := session.handleReInit(conn); done {
-			break
+		session.cond2.L.Lock()
+		session.cond2.Broadcast()
+		session.cond2.L.Unlock()
+
+		select {
+		case <-session.done:
+			return
+		case err := <-session.notifyConnClose:
+			{
+				if err == nil { // expected shutdown
+					return
+				}
+				log.Printf("Connection closed:%v", err)
+			}
 		}
+		log.Printf("Reconnecting...")
 	}
 }
 
 // connect will create a new AMQP connection
-func (session *Session) connect(addr string) (*amqp.Connection, error) {
-	conn, err := amqp.Dial(addr)
+func (session *Session) connect() (*amqp.Connection, error) {
+	conn, err := amqp.Dial(session.addr)
 	if err != nil {
 		return nil, err
 	}
 
 	session.changeConnection(conn)
-	session.logger.Info("Connected!")
+	log.Println("Connected!")
 	return conn, nil
 }
 
 // handleReconnect will wait for a channel error
 // and then continuously attempt to re-initialize both channels
-func (session *Session) handleReInit(conn *amqp.Connection) bool {
+func (session *Session) handleReOpenChannel() {
 	for {
 		atomic.StoreInt32(&session.isReady, 0)
 
-		err := session.init(conn)
+		session.cond2.L.Lock()
+
+		for session.connection == nil || session.connection.IsClosed() {
+			session.cond2.Wait()
+			select {
+			case <-session.done:
+				return
+			default:
+			}
+		}
+
+		err := session.init(session.connection)
+
+		session.cond2.L.Unlock()
 
 		if err != nil {
-			session.logger.Errorf("Error init:%v", err)
-			session.logger.Info("Failed to initialize channel. Retrying...")
+			log.Printf("Error init:%v", err)
+			log.Printf("Failed to initialize channel. Retrying...")
 
 			select {
 			case <-session.done:
-				return true
+				return
 			case <-time.After(reInitDelay):
 			}
 			continue
@@ -145,70 +204,38 @@ func (session *Session) handleReInit(conn *amqp.Connection) bool {
 
 		select {
 		case <-session.done:
-			return true
-		case err := <-session.notifyConnClose:
+			return
+		case err := <-session.notifyChanClose:
 			{
-				if err == nil {
-					return true
+				if err == nil { // expected shutdown
+					return
 				}
-				session.logger.Info("Connection closed. Reconnecting...")
-				return false
+				log.Printf("Channel closed:%v", err)
 			}
-			// case <-session.notifyChanClose:
-			// 	session.logger.Info("Channel closed. Re-running init...")
 		}
+		log.Println("Re-running init...")
 	}
 }
 
 // init will initialize channel & declare queue
 func (session *Session) init(conn *amqp.Connection) error {
+	if conn == nil || conn.IsClosed() {
+		return ErrNotConnected
+	}
+
 	ch, err := conn.Channel()
 	if err != nil {
 		return err
 	}
 
-	err = ch.Confirm(false)
-	if err != nil {
+	if err := session.declare(ch); err != nil {
 		return err
 	}
 
-	err = ch.ExchangeDeclare(
-		session.exchangeName, // name
-		session.exchangeType, // type
-		false,                // durable
-		false,                // auto-deleted
-		false,                // internal
-		false,                // no-wait
-		nil,                  // arguments
-	)
-	if err != nil {
+	if err := ch.Confirm(false); err != nil {
 		return err
 	}
-
-	_, err = ch.QueueDeclare(
-		session.queueName,
-		true,  // Durable
-		false, // Delete when unused
-		false, // Exclusive
-		false, // No-wait
-		nil,   // Arguments
-	)
-	if err != nil {
-		return err
-	}
-
-	err = ch.QueueBind(
-		session.queueName,
-		session.bindingKey,
-		session.exchangeName,
-		false,
-		nil)
-	if err != nil {
-		return err
-	}
-
-	err = ch.Qos(1, 0, false)
-	if err != nil {
+	if err = ch.Qos(1, 0, false); err != nil {
 		return err
 	}
 
@@ -220,7 +247,47 @@ func (session *Session) init(conn *amqp.Connection) error {
 	session.cond.Signal()
 	session.cond.L.Unlock()
 
-	session.logger.Info("Setup!")
+	log.Printf("Setup!")
+
+	return nil
+}
+
+func (session *Session) declare(ch *amqp.Channel) error {
+	if !session.declarationSet.isDecalre {
+		return nil
+	}
+
+	if err := ch.ExchangeDeclare(
+		session.declarationSet.Exchange.Name,       // name
+		session.declarationSet.Exchange.Kind,       // type
+		session.declarationSet.Exchange.Durable,    // durable
+		session.declarationSet.Exchange.AutoDelete, // auto-deleted
+		session.declarationSet.Exchange.Internal,   // internal
+		false,                                      // no-wait
+		nil,                                        // arguments
+	); err != nil {
+		return err
+	}
+
+	if _, err := ch.QueueDeclare(
+		session.declarationSet.Queue.Name,       // name
+		session.declarationSet.Queue.Durable,    // durable
+		session.declarationSet.Queue.AutoDelete, // delete when unused
+		session.declarationSet.Queue.Exclusive,  // exclusive
+		false,                                   // no-wait
+		nil,                                     // arguments
+	); err != nil {
+		return err
+	}
+
+	if err := ch.QueueBind(
+		session.declarationSet.Bind.QueueName,
+		session.declarationSet.Bind.Key,
+		session.declarationSet.Bind.ExchangeName,
+		false,
+		nil); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -237,10 +304,9 @@ func (session *Session) runConsumers() {
 		}
 
 		for _, cons := range session.consumers {
-			if atomic.CompareAndSwapInt32(&cons.run, 0, 1) {
+			if atomic.LoadInt32(&cons.run) == 0 && atomic.LoadInt32(&session.isReady) == 1 {
 				if err := session.runConsumer(cons); err != nil {
-					atomic.StoreInt32(&cons.run, 0)
-					session.logger.Errorf("failed to runConsumer:%v", err)
+					log.Printf("failed to runConsumer:%v", err)
 				}
 			}
 		}
@@ -254,9 +320,10 @@ func (session *Session) runConsumer(cons *Consumer) error {
 	if err != nil {
 		return err
 	}
+	atomic.StoreInt32(&cons.run, 1)
 
 	go func() {
-		session.logger.Info("Consumer init!")
+		log.Printf("Consumer running!")
 		for d := range deliveries {
 			select {
 			case <-session.done:
@@ -267,7 +334,7 @@ func (session *Session) runConsumer(cons *Consumer) error {
 			session.handleDelivery(d, cons.handler)
 		}
 		atomic.StoreInt32(&cons.run, 0)
-		session.logger.Info("Consumer closed!")
+		log.Printf("Consumer closed!")
 
 		session.cond.L.Lock()
 		session.cond.Signal()
@@ -289,9 +356,9 @@ func (session *Session) changeConnection(connection *amqp.Connection) {
 // and updates the channel listeners to reflect this.
 func (session *Session) changeChannel(channel *amqp.Channel) {
 	session.channel = channel
-	// session.notifyChanClose = make(chan *amqp.Error)
+	session.notifyChanClose = make(chan *amqp.Error)
 	session.notifyConfirm = make(chan amqp.Confirmation, 1)
-	// session.channel.NotifyClose(session.notifyChanClose)
+	session.channel.NotifyClose(session.notifyChanClose)
 	session.channel.NotifyPublish(session.notifyConfirm)
 }
 
@@ -307,7 +374,7 @@ func (session *Session) Push(data []byte) error {
 	for {
 		err := session.UnsafePush(data)
 		if err != nil {
-			//session.log.Info("Push failed. Retrying...")
+			log.Printf("Push failed. Retrying...")
 			select {
 			case <-session.done:
 				return ErrShutdown
@@ -323,7 +390,7 @@ func (session *Session) Push(data []byte) error {
 			}
 		case <-time.After(resendDelay):
 		}
-		//log.Println("Push didn't confirm. Retrying...")
+		log.Printf("Push didn't confirm. Retrying...")
 	}
 }
 
@@ -335,11 +402,14 @@ func (session *Session) UnsafePush(data []byte) error {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return ErrNotConnected
 	}
+	if !session.declarationSet.isUsageDefault {
+		return fmt.Errorf("Don't set exchange and routing key")
+	}
 	return session.channel.Publish(
-		session.exchangeName, // Exchange
-		session.bindingKey,   // Routing key
-		false,                // Mandatory
-		false,                // Immediate
+		session.declarationSet.Exchange.Name, // Exchange
+		session.declarationSet.Bind.Key,      // Routing key
+		false,                                // Mandatory
+		false,                                // Immediate
 		amqp.Publishing{
 			ContentType:  "text/plain",
 			DeliveryMode: amqp.Persistent,
@@ -356,14 +426,17 @@ func (session *Session) Stream() (<-chan amqp.Delivery, error) {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return nil, ErrNotConnected
 	}
+	if !session.declarationSet.isUsageDefault {
+		return nil, fmt.Errorf("Don't set queue")
+	}
 	return session.channel.Consume(
-		session.queueName,
-		session.consumerTag, // Consumer
-		false,               // Auto-Ack
-		false,               // Exclusive
-		false,               // No-local
-		false,               // No-Wait
-		nil,                 // Args
+		session.declarationSet.Queue.Name, // Queue
+		"",                                // Consumer
+		false,                             // Auto-Ack
+		false,                             // Exclusive
+		false,                             // No-local
+		false,                             // No-Wait
+		nil,                               // Args
 	)
 }
 
@@ -381,7 +454,7 @@ func (session *Session) Subscribe(handler func([]byte) error) error {
 func (session *Session) handleDelivery(d amqp.Delivery, handler EventHandler) {
 	defer func() {
 		if r := recover(); r != nil {
-			session.logger.Infof("handleDelivery panic:%v", r)
+			log.Printf("handleDelivery panic:%v", r)
 			_ = d.Nack(false, true)
 		}
 	}()
@@ -389,7 +462,7 @@ func (session *Session) handleDelivery(d amqp.Delivery, handler EventHandler) {
 	if err := handler(d.Body); err == nil {
 		_ = d.Ack(false)
 	} else {
-		session.logger.Errorf("failed to handler msg:%v", err)
+		log.Printf("Failed to handler msg:%v", err)
 		_ = d.Nack(false, true)
 	}
 }
@@ -410,5 +483,6 @@ func (session *Session) Close() error {
 	}
 	close(session.done)
 	session.cond.Broadcast()
+	log.Printf("Session closed!")
 	return nil
 }
