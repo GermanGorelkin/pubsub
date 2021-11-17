@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "session",
+			"path": "../"
+		},
+		{	
+			"name": "e2e",
+			"path": "../e2e"
+		}
+	],
+	"settings": {}
+}
