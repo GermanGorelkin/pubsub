@@ -1,4 +1,4 @@
-package rabbitmq_session
+package e2e
 
 import (
 	"fmt"
@@ -10,51 +10,80 @@ import (
 
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
 
-	session "github.com/germangorelkin/rabbitmq-session"
+	pubsub "github.com/germangorelkin/pubsub"
 )
 
-var opts = &dockertest.RunOptions{
-	Repository:   "rabbitmq",
-	Tag:          "3.9-management-alpine",
-	ExposedPorts: []string{"5672"},
-	PortBindings: map[docker.Port][]docker.PortBinding{"5672": {{HostIP: "0.0.0.0", HostPort: "5672"}}},
+func TestRabbitmqSessionSuite(t *testing.T) {
+	suite.Run(t, new(RabbitmqSessionSuite))
 }
 
-func TestOpenClose(t *testing.T) {
+type RabbitmqSessionSuite struct {
+	suite.Suite
 
-	// uses a sensible default on windows (tcp/http) and linux/osx (socket)
+	resource *dockertest.Resource
+	pool     *dockertest.Pool
+	opts     *dockertest.RunOptions
+
+	session *pubsub.Session
+}
+
+func (s *RabbitmqSessionSuite) SetupSuite() {
+	s.opts = &dockertest.RunOptions{
+		Repository:   "rabbitmq",
+		Tag:          "3.9-alpine",
+		ExposedPorts: []string{"5672", "15672"},
+		PortBindings: map[docker.Port][]docker.PortBinding{"5672": {{HostIP: "0.0.0.0", HostPort: "5672"}}, "15672": {{HostIP: "0.0.0.0", HostPort: "15672"}}},
+		Name:         "rebbitmq-e2e-for-session-ZReqe13s4lg",
+	}
+
 	pool, err := dockertest.NewPool("")
-	if err != nil {
-		log.Fatalf("Could not connect to docker: %s", err)
+	s.Require().Nilf(err, "failed to connect to docker")
+	s.pool = pool
+}
+
+// func (s *RabbitmqSessionSuite) TearDownSuite() {}
+
+func (s *RabbitmqSessionSuite) SetupTest() {
+	// stop container if it's already running
+	if cont, ok := s.pool.ContainerByName(s.opts.Name); ok {
+		cont.Close()
 	}
 
-	log.Println("connect to docker")
+	// runnig container
+	resource, err := s.pool.RunWithOptions(s.opts)
+	s.Require().Nilf(err, "failed to run container")
+	s.resource = resource
+	// log.Printf("container id=%s is running", s.resource.Container.ID)
 
-	// pulls an image, creates a container based on it and runs it
-	resource, err := pool.RunWithOptions(opts)
-	if err != nil {
-		log.Fatalf("Could not start resource: %s", err)
-	}
-
-	defer pool.Purge(resource)
-	log.Printf("run container id=%s", resource.Container.ID)
-
-	session := session.New("amqp://guest:guest@localhost:5672/",
-		session.WithDeclare(
-			session.Exchange{Name: "exchange_test", Kind: "topic"},
-			session.Queue{Name: "queue_test"},
-			session.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
+	// new session
+	s.session = pubsub.New("amqp://guest:guest@localhost:5672/",
+		pubsub.WithDeclare(
+			pubsub.Exchange{Name: "exchange_test", Kind: "topic"},
+			pubsub.Queue{Name: "queue_test", Durable: true},
+			pubsub.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
 	)
-	defer session.Close()
+}
 
+func (s *RabbitmqSessionSuite) TearDownTest() {
+	// session
+	s.session.Close()
+
+	// container
+	if s.resource != nil {
+		log.Printf("container id=%s is stopping", s.resource.Container.ID)
+		s.resource.Close()
+	}
+}
+
+func (s *RabbitmqSessionSuite) TestPushAndTwoSubscribe() {
 	numOfMsg := 100
 
 	go func() {
 		for i := 0; i < numOfMsg; {
 			message := []byte(fmt.Sprintf("message %d", i))
-			if err := session.Push(message); err == nil {
+			if err := s.session.Push(message); err == nil {
 				i++
 			}
 		}
@@ -64,74 +93,45 @@ func TestOpenClose(t *testing.T) {
 	wg.Add(numOfMsg)
 	var receivedMsg uint64
 
-	if err := session.Subscribe(func(b []byte) error {
+	err := s.session.Subscribe(func(b []byte) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
-	}); err != nil {
-		t.Fatalf("failed to Subscribe")
-	}
+	})
+	s.Require().Nilf(err, "failed to Subscribe1")
 
-	if err := session.Subscribe(func(b []byte) error {
+	err = s.session.Subscribe(func(b []byte) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
-	}); err != nil {
-		t.Fatalf("failed to Subscribe")
-	}
+	})
+	s.Require().Nilf(err, "failed to Subscribe2")
 
 	// TODO wait with timeout
 	wg.Wait()
 
-	assert.Equal(t, numOfMsg, int(receivedMsg))
+	s.Equal(numOfMsg, int(receivedMsg))
 }
 
-func TestOpenClose2(t *testing.T) {
-
-	// uses a sensible default on windows (tcp/http) and linux/osx (socket)
-	pool, err := dockertest.NewPool("")
-	if err != nil {
-		log.Fatalf("Could not connect to docker: %s", err)
-	}
-
-	log.Println("connect to docker")
-
-	// pulls an image, creates a container based on it and runs it
-	resource, err := pool.RunWithOptions(opts)
-	if err != nil {
-		log.Fatalf("Could not start resource: %s", err)
-	}
-	defer pool.Purge(resource)
-	log.Printf("run container id=%s", resource.Container.ID)
-
-	session := session.New("amqp://guest:guest@localhost:5672/",
-		session.WithDeclare(
-			session.Exchange{Name: "exchange_test", Kind: "topic"},
-			session.Queue{Name: "queue_test"},
-			session.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
-	)
-	defer session.Close()
-
+func (s *RabbitmqSessionSuite) TestReconnectWhileSendingMsgs() {
 	numOfMsg := 100
 
 	go func() {
 		for i := 0; i < numOfMsg; {
 			message := []byte(fmt.Sprintf("message %d", i))
-			if err := session.Push(message); err == nil {
+			if err := s.session.Push(message); err == nil {
 				i++
 
 				if i == numOfMsg/2 {
-					log.Println("container stoping")
-					if err := pool.Client.StopContainer(resource.Container.ID, 0); err != nil {
-						log.Printf("failed to stop container id=%s:%v", resource.Container.ID, err)
-					}
+					// log.Println("container stoping")
+					err := s.pool.Client.StopContainer(s.resource.Container.ID, 0)
+					s.Require().Nilf(err, "failed to stop container id=%s", s.resource.Container.ID)
 
 					time.Sleep(1 * time.Second)
 
-					log.Println("container starting")
-					if err := pool.Client.StartContainer(resource.Container.ID, nil); err != nil {
-						log.Printf("failed to start container id=%s:%v", resource.Container.ID, err)
-					}
+					// log.Println("container starting")
+					err = s.pool.Client.StartContainer(s.resource.Container.ID, nil)
+					s.Require().Nilf(err, "failed to start container id=%s", s.resource.Container.ID)
 				}
 			}
 		}
@@ -141,59 +141,32 @@ func TestOpenClose2(t *testing.T) {
 	wg.Add(numOfMsg)
 	var receivedMsg uint64
 
-	if err := session.Subscribe(func(b []byte) error {
+	err := s.session.Subscribe(func(b []byte) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
-	}); err != nil {
-		t.Fatalf("failed to Subscribe")
-	}
+	})
+	s.Require().Nilf(err, "failed to Subscribe1")
 
-	if err := session.Subscribe(func(b []byte) error {
+	err = s.session.Subscribe(func(b []byte) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
-	}); err != nil {
-		t.Fatalf("failed to Subscribe")
-	}
+	})
+	s.Require().Nilf(err, "failed to Subscribe2")
 
 	wg.Wait()
 
-	assert.Equal(t, numOfMsg, int(receivedMsg))
+	s.Equal(numOfMsg, int(receivedMsg))
 }
 
-func TestOpenClose3(t *testing.T) {
-
-	// uses a sensible default on windows (tcp/http) and linux/osx (socket)
-	pool, err := dockertest.NewPool("")
-	if err != nil {
-		log.Fatalf("Could not connect to docker: %s", err)
-	}
-
-	log.Println("connect to docker")
-
-	// pulls an image, creates a container based on it and runs it
-	resource, err := pool.RunWithOptions(opts)
-	if err != nil {
-		log.Fatalf("Could not start resource: %s", err)
-	}
-	defer pool.Purge(resource)
-	log.Printf("run container id=%s", resource.Container.ID)
-
-	session := session.New("amqp://guest:guest@localhost:5672/",
-		session.WithDeclare(
-			session.Exchange{Name: "exchange_test", Kind: "topic"},
-			session.Queue{Name: "queue_test", Durable: true},
-			session.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
-	)
-	defer session.Close()
-
+func (s *RabbitmqSessionSuite) TestReconnectWhileReceivingMsgs() {
 	numOfMsg := 100
 
 	go func() {
 		for i := 0; i < numOfMsg; {
 			message := []byte(fmt.Sprintf("message %d", i))
-			if err := session.Push(message); err == nil {
+			if err := s.session.Push(message); err == nil {
 				i++
 			}
 		}
@@ -203,30 +176,27 @@ func TestOpenClose3(t *testing.T) {
 	wg.Add(numOfMsg)
 	var receivedMsg uint64
 
-	if err := session.Subscribe(func(b []byte) error {
+	err := s.session.Subscribe(func(b []byte) error {
 		atomic.AddUint64(&receivedMsg, 1)
 
 		if atomic.LoadUint64(&receivedMsg) == uint64(numOfMsg/2) {
-			log.Println("container stoping")
-			if err := pool.Client.StopContainer(resource.Container.ID, 0); err != nil {
-				log.Printf("failed to stop container id=%s:%v", resource.Container.ID, err)
-			}
+			// log.Println("container stoping")
+			err := s.pool.Client.StopContainer(s.resource.Container.ID, 0)
+			s.Require().Nilf(err, "failed to stop container id=%s", s.resource.Container.ID)
 
 			time.Sleep(1 * time.Second)
 
-			log.Println("container starting")
-			if err := pool.Client.StartContainer(resource.Container.ID, nil); err != nil {
-				log.Printf("failed to start container id=%s:%v", resource.Container.ID, err)
-			}
+			// log.Println("container starting")
+			err = s.pool.Client.StartContainer(s.resource.Container.ID, nil)
+			s.Require().Nilf(err, "failed to start container id=%s", s.resource.Container.ID)
 		}
 
 		wg.Done()
 		return nil
-	}); err != nil {
-		t.Fatalf("failed to Subscribe")
-	}
+	})
+	s.Require().Nilf(err, "failed to Subscribe")
 
 	wg.Wait()
 
-	assert.Equal(t, numOfMsg, int(receivedMsg))
+	s.Equal(numOfMsg, int(receivedMsg))
 }

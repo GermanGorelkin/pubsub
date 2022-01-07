@@ -1,4 +1,4 @@
-module github.com/germangorelkin/rabbitmq-session
+module github.com/germangorelkin/pubsub
 
 go 1.17
 

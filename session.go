@@ -1,4 +1,4 @@
-package rabbitmq_session
+package pubsub
 
 import (
 	"errors"
@@ -212,10 +212,10 @@ func (session *Session) handleReOpenChannel() {
 			return
 		case err := <-session.notifyChanClose:
 			{
+				log.Printf("Channel closed:%v", err)
 				if err == nil { // expected shutdown
 					return
 				}
-				log.Printf("Channel closed:%v", err)
 			}
 		}
 		log.Println("Re-running init...")

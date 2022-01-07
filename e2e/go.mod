@@ -1,11 +1,11 @@
-module github.com/germangorelkin/rabbitmq-session/e2e
+module github.com/germangorelkin/pubsub/e2e
 
 go 1.17
 
-replace github.com/germangorelkin/rabbitmq-session => ../
+replace github.com/germangorelkin/pubsub => ../
 
 require (
-	github.com/germangorelkin/rabbitmq-session v0.0.0-00010101000000-000000000000
+	github.com/germangorelkin/pubsub v0.0.0-00010101000000-000000000000
 	github.com/ory/dockertest/v3 v3.8.0
 	github.com/stretchr/testify v1.7.0
 )
