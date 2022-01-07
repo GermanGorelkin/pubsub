@@ -67,10 +67,8 @@ func (s *RabbitmqSessionSuite) SetupTest() {
 }
 
 func (s *RabbitmqSessionSuite) TearDownTest() {
-	// session
 	s.session.Close()
 
-	// container
 	if s.resource != nil {
 		log.Printf("container id=%s is stopping", s.resource.Container.ID)
 		s.resource.Close()

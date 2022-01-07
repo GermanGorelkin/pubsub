@@ -85,8 +85,9 @@ type Session struct {
 	}
 
 	consumers []*Consumer
-	cond      *sync.Cond
-	cond2     *sync.Cond
+
+	cond  *sync.Cond // wait when add new no running consumer or initialize channel & declare
+	cond2 *sync.Cond // wait when Session connects to server
 
 	connection      *amqp.Connection
 	channel         *amqp.Channel
@@ -183,7 +184,7 @@ func (session *Session) handleReOpenChannel() {
 		session.cond2.L.Lock()
 
 		for session.connection == nil || session.connection.IsClosed() {
-			session.cond2.Wait()
+			session.cond2.Wait() // wait when Session connects to server
 			select {
 			case <-session.done:
 				return
@@ -249,7 +250,7 @@ func (session *Session) init(conn *amqp.Connection) error {
 	atomic.StoreInt32(&session.isReady, 1)
 
 	session.cond.L.Lock()
-	session.cond.Signal()
+	session.cond.Signal() // initialize channel & declare
 	session.cond.L.Unlock()
 
 	log.Printf("Setup!")
@@ -300,7 +301,7 @@ func (session *Session) declare(ch *amqp.Channel) error {
 func (session *Session) handleConsumers() {
 	for {
 		session.cond.L.Lock()
-		session.cond.Wait()
+		session.cond.Wait() // wait when add new no running consumer or initialize channel & declare
 
 		select {
 		case <-session.done:
@@ -308,10 +309,10 @@ func (session *Session) handleConsumers() {
 		default:
 		}
 
-		for _, cons := range session.consumers {
-			if atomic.LoadInt32(&cons.run) == 0 && atomic.LoadInt32(&session.isReady) == 1 {
-				if err := session.handleConsumer(cons); err != nil {
-					log.Printf("failed to handleConsumer:%v", err)
+		for _, consumer := range session.consumers {
+			if atomic.LoadInt32(&consumer.run) == 0 && atomic.LoadInt32(&session.isReady) == 1 {
+				if err := session.runConsumer(consumer); err != nil {
+					log.Printf("failed to runConsumer:%v", err)
 				}
 			}
 		}
@@ -320,12 +321,15 @@ func (session *Session) handleConsumers() {
 	}
 }
 
-func (session *Session) handleConsumer(cons *Consumer) error {
-	deliveries, err := session.Stream(cons)
+func (session *Session) runConsumer(consumer *Consumer) error {
+	if atomic.LoadInt32(&session.isReady) == 0 {
+		return ErrNotConnected
+	}
+	deliveries, err := session.Stream(consumer)
 	if err != nil {
 		return err
 	}
-	atomic.StoreInt32(&cons.run, 1)
+	atomic.StoreInt32(&consumer.run, 1)
 
 	go func() {
 		log.Printf("Consumer running!")
@@ -336,22 +340,41 @@ func (session *Session) handleConsumer(cons *Consumer) error {
 			default:
 			}
 
-			session.handleDelivery(d, cons.Handler)
+			session.handleDelivery(d, consumer.Handler)
 		}
-		atomic.StoreInt32(&cons.run, 0)
-		log.Printf("Consumer closed!")
+		atomic.StoreInt32(&consumer.run, 0)
+		log.Printf("Consumer stopped!")
 
 		session.cond.L.Lock()
-		session.cond.Signal()
+		session.cond.Signal() // new no running consumer
 		session.cond.L.Unlock()
 	}()
 
 	return nil
 }
 
+func (session *Session) handleDelivery(d amqp.Delivery, handler EventHandler) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("handleDelivery panic:%v", r)
+			_ = d.Nack(false, true)
+		}
+	}()
+
+	if err := handler(d.Body); err == nil {
+		_ = d.Ack(false)
+	} else {
+		log.Printf("Failed to handler msg:%v", err)
+		_ = d.Nack(false, true)
+	}
+}
+
 // changeConnection takes a new connection to the queue,
 // and updates the close listener to reflect this.
 func (session *Session) changeConnection(connection *amqp.Connection) {
+	session.cond2.L.Lock()
+	defer session.cond2.L.Unlock()
+
 	session.connection = connection
 	session.notifyConnClose = make(chan *amqp.Error)
 	session.connection.NotifyClose(session.notifyConnClose)
@@ -360,6 +383,9 @@ func (session *Session) changeConnection(connection *amqp.Connection) {
 // changeChannel takes a new channel to the queue,
 // and updates the channel listeners to reflect this.
 func (session *Session) changeChannel(channel *amqp.Channel) {
+	session.cond.L.Lock()
+	defer session.cond.L.Unlock()
+
 	session.channel = channel
 	session.notifyChanClose = make(chan *amqp.Error)
 	session.notifyConfirm = make(chan amqp.Confirmation, 1)
@@ -374,10 +400,17 @@ func (session *Session) changeChannel(channel *amqp.Channel) {
 // only returned if the push action itself fails, see UnsafePush.
 func (session *Session) Push(data []byte) error {
 	if atomic.LoadInt32(&session.isReady) == 0 {
-		return errors.New("failed to push push: not connected")
+		return ErrNotConnected
 	}
+	if !session.declarationSet.isUsageDefault {
+		return errors.New("Don't set exchange and routing key")
+	}
+
+	exchange := session.declarationSet.Exchange.Name
+	key := session.declarationSet.Bind.Key
+
 	for {
-		err := session.UnsafePush(data)
+		err := session.UnsafePush(data, exchange, key)
 		if err != nil {
 			log.Printf("Push failed. Retrying...")
 			select {
@@ -390,7 +423,6 @@ func (session *Session) Push(data []byte) error {
 		select {
 		case confirm := <-session.notifyConfirm:
 			if confirm.Ack {
-				//log.Println("Push confirmed!")
 				return nil
 			}
 		case <-time.After(resendDelay):
@@ -403,18 +435,15 @@ func (session *Session) Push(data []byte) error {
 // confirmation. It returns an error if it fails to connect.
 // No guarantees are provided for whether the server will
 // recieve the message.
-func (session *Session) UnsafePush(data []byte) error {
+func (session *Session) UnsafePush(data []byte, exchange, key string) error {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return ErrNotConnected
 	}
-	if !session.declarationSet.isUsageDefault {
-		return fmt.Errorf("Don't set exchange and routing key")
-	}
 	return session.channel.Publish(
-		session.declarationSet.Exchange.Name, // Exchange
-		session.declarationSet.Bind.Key,      // Routing key
-		false,                                // Mandatory
-		false,                                // Immediate
+		exchange, // Exchange
+		key,      // Routing key
+		false,    // Mandatory
+		false,    // Immediate
 		amqp.Publishing{
 			ContentType:  "text/plain",
 			DeliveryMode: amqp.Persistent,
@@ -453,26 +482,10 @@ func (session *Session) Subscribe(handler func([]byte) error) error {
 
 	session.cond.L.Lock()
 	session.consumers = append(session.consumers, cons)
-	session.cond.Signal()
+	session.cond.Signal() // new no running consumer
 	session.cond.L.Unlock()
 
 	return nil
-}
-
-func (session *Session) handleDelivery(d amqp.Delivery, handler EventHandler) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("handleDelivery panic:%v", r)
-			_ = d.Nack(false, true)
-		}
-	}()
-
-	if err := handler(d.Body); err == nil {
-		_ = d.Ack(false)
-	} else {
-		log.Printf("Failed to handler msg:%v", err)
-		_ = d.Nack(false, true)
-	}
 }
 
 // Close will cleanly shutdown the channel and connection.
