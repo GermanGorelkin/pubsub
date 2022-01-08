@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -75,7 +76,7 @@ func (s *RabbitmqSessionSuite) TearDownTest() {
 	}
 }
 
-func (s *RabbitmqSessionSuite) TestPushAndTwoSubscribe() {
+func (s *RabbitmqSessionSuite) Test_onePublisher_twoSubscribe() {
 	numOfMsg := 100
 
 	go func() {
@@ -105,13 +106,15 @@ func (s *RabbitmqSessionSuite) TestPushAndTwoSubscribe() {
 	})
 	s.Require().Nilf(err, "failed to Subscribe2")
 
-	// TODO wait with timeout
-	wg.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	err = waitWithCtx(ctx, &wg)
+	s.Require().Nilf(err, "timedout waiting for wait group")
 
 	s.Equal(numOfMsg, int(receivedMsg))
 }
 
-func (s *RabbitmqSessionSuite) TestReconnectWhileSendingMsgs() {
+func (s *RabbitmqSessionSuite) Test_reconnect_whilePublishingMsgs() {
 	numOfMsg := 100
 
 	go func() {
@@ -153,12 +156,15 @@ func (s *RabbitmqSessionSuite) TestReconnectWhileSendingMsgs() {
 	})
 	s.Require().Nilf(err, "failed to Subscribe2")
 
-	wg.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	err = waitWithCtx(ctx, &wg)
+	s.Require().Nilf(err, "timedout waiting for wait group")
 
 	s.Equal(numOfMsg, int(receivedMsg))
 }
 
-func (s *RabbitmqSessionSuite) TestReconnectWhileReceivingMsgs() {
+func (s *RabbitmqSessionSuite) Test_reconnect_whileReceivingMsgs() {
 	numOfMsg := 100
 
 	go func() {
@@ -194,7 +200,25 @@ func (s *RabbitmqSessionSuite) TestReconnectWhileReceivingMsgs() {
 	})
 	s.Require().Nilf(err, "failed to Subscribe")
 
-	wg.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	err = waitWithCtx(ctx, &wg)
+	s.Require().Nilf(err, "timedout waiting for wait group")
 
 	s.Equal(numOfMsg, int(receivedMsg))
+}
+
+func waitWithCtx(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

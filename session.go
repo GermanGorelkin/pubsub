@@ -499,8 +499,6 @@ func (session *Session) Stream(c *Consumer) (<-chan amqp.Delivery, error) {
 	)
 }
 
-// TODO AddConsumer DeleteConsumer
-
 func (session *Session) Subscribe(handler func([]byte) error) error {
 	if !session.declarationSet.isUsageDefault {
 		return ErrNotSetDefaultQueue
@@ -515,13 +513,19 @@ func (session *Session) SubscribeTo(queue string, handler func([]byte) error) er
 		QueueName: queue,
 	}
 
+	return session.AddConsumer(cons)
+}
+
+func (session *Session) AddConsumer(c *Consumer) error {
 	session.cond.L.Lock()
-	session.consumers = append(session.consumers, cons)
+	session.consumers = append(session.consumers, c)
 	session.cond.Signal() // new no running consumer
 	session.cond.L.Unlock()
 
 	return nil
 }
+
+// TODO AddConsumer DeleteConsumer
 
 // Close will cleanly shutdown the channel and connection.
 func (session *Session) Close() error {
