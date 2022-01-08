@@ -81,7 +81,7 @@ func (s *RabbitmqSessionSuite) TestPushAndTwoSubscribe() {
 	go func() {
 		for i := 0; i < numOfMsg; {
 			message := []byte(fmt.Sprintf("message %d", i))
-			if err := s.session.Push(message); err == nil {
+			if err := s.session.Publish(message); err == nil {
 				i++
 			}
 		}
@@ -117,7 +117,7 @@ func (s *RabbitmqSessionSuite) TestReconnectWhileSendingMsgs() {
 	go func() {
 		for i := 0; i < numOfMsg; {
 			message := []byte(fmt.Sprintf("message %d", i))
-			if err := s.session.Push(message); err == nil {
+			if err := s.session.Publish(message); err == nil {
 				i++
 
 				if i == numOfMsg/2 {
@@ -164,7 +164,7 @@ func (s *RabbitmqSessionSuite) TestReconnectWhileReceivingMsgs() {
 	go func() {
 		for i := 0; i < numOfMsg; {
 			message := []byte(fmt.Sprintf("message %d", i))
-			if err := s.session.Push(message); err == nil {
+			if err := s.session.Publish(message); err == nil {
 				i++
 			}
 		}

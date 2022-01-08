@@ -2,7 +2,6 @@ package pubsub
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -23,9 +22,11 @@ const (
 )
 
 var (
-	ErrNotConnected  = errors.New("not connected to a server")
-	ErrAlreadyClosed = errors.New("already closed: not connected to the server")
-	ErrShutdown      = errors.New("session is shutting down")
+	ErrNotConnected          = errors.New("not connected to a server")
+	ErrAlreadyClosed         = errors.New("already closed: not connected to the server")
+	ErrShutdown              = errors.New("session is shutting down")
+	ErrNotSetDefaultQueue    = errors.New("default queue is not set")
+	ErrNotSetDefaultExchange = errors.New("default exchange or key is not set")
 )
 
 type Exchange struct {
@@ -398,19 +399,46 @@ func (session *Session) changeChannel(channel *amqp.Channel) {
 // it continuously re-sends messages until a confirm is received.
 // This will block until the server sends a confirm. Errors are
 // only returned if the push action itself fails, see UnsafePush.
-func (session *Session) Push(data []byte) error {
+func (session *Session) Publish(message []byte) error {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return ErrNotConnected
 	}
 	if !session.declarationSet.isUsageDefault {
-		return errors.New("Don't set exchange and routing key")
+		return ErrNotSetDefaultExchange
 	}
 
 	exchange := session.declarationSet.Exchange.Name
 	key := session.declarationSet.Bind.Key
 
 	for {
-		err := session.UnsafePush(data, exchange, key)
+		err := session.UnsafePublish(message, exchange, key)
+		if err != nil {
+			log.Printf("Push failed. Retrying...")
+			select {
+			case <-session.done:
+				return ErrShutdown
+			case <-time.After(resendDelay):
+			}
+			continue
+		}
+		select {
+		case confirm := <-session.notifyConfirm:
+			if confirm.Ack {
+				return nil
+			}
+		case <-time.After(resendDelay):
+		}
+		log.Printf("Push didn't confirm. Retrying...")
+	}
+}
+
+func (session *Session) PublishTo(exchange, key string, message []byte) error {
+	if atomic.LoadInt32(&session.isReady) == 0 {
+		return ErrNotConnected
+	}
+
+	for {
+		err := session.UnsafePublish(message, exchange, key)
 		if err != nil {
 			log.Printf("Push failed. Retrying...")
 			select {
@@ -435,7 +463,7 @@ func (session *Session) Push(data []byte) error {
 // confirmation. It returns an error if it fails to connect.
 // No guarantees are provided for whether the server will
 // recieve the message.
-func (session *Session) UnsafePush(data []byte, exchange, key string) error {
+func (session *Session) UnsafePublish(message []byte, exchange, key string) error {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return ErrNotConnected
 	}
@@ -447,7 +475,7 @@ func (session *Session) UnsafePush(data []byte, exchange, key string) error {
 		amqp.Publishing{
 			ContentType:  "text/plain",
 			DeliveryMode: amqp.Persistent,
-			Body:         data,
+			Body:         message,
 		},
 	)
 }
@@ -460,9 +488,6 @@ func (session *Session) Stream(c *Consumer) (<-chan amqp.Delivery, error) {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return nil, ErrNotConnected
 	}
-	if !session.declarationSet.isUsageDefault {
-		return nil, fmt.Errorf("Don't set queue")
-	}
 	return session.channel.Consume(
 		c.QueueName, // Queue
 		c.Name,      // Consumer
@@ -474,10 +499,20 @@ func (session *Session) Stream(c *Consumer) (<-chan amqp.Delivery, error) {
 	)
 }
 
+// TODO AddConsumer DeleteConsumer
+
 func (session *Session) Subscribe(handler func([]byte) error) error {
+	if !session.declarationSet.isUsageDefault {
+		return ErrNotSetDefaultQueue
+	}
+	queue := session.declarationSet.Queue.Name
+	return session.SubscribeTo(queue, handler)
+}
+
+func (session *Session) SubscribeTo(queue string, handler func([]byte) error) error {
 	cons := &Consumer{
 		Handler:   handler,
-		QueueName: session.declarationSet.Queue.Name,
+		QueueName: queue,
 	}
 
 	session.cond.L.Lock()
