@@ -61,9 +61,9 @@ func (s *RabbitmqSessionSuite) SetupTest() {
 	// new session
 	s.session = pubsub.New("amqp://guest:guest@localhost:5672/",
 		pubsub.WithDeclare(
-			pubsub.Exchange{Name: "exchange_test", Kind: "topic"},
-			pubsub.Queue{Name: "queue_test", Durable: true},
-			pubsub.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test"}),
+			pubsub.Exchange{Name: "exchange_test", Kind: "topic", IsUsageDefault: true},
+			pubsub.Queue{Name: "queue_test", Durable: true, IsUsageDefault: true},
+			pubsub.Bind{QueueName: "queue_test", ExchangeName: "exchange_test", Key: "test", IsUsageDefault: true}),
 	)
 }
 

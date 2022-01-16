@@ -35,6 +35,8 @@ type Exchange struct {
 	Durable    bool
 	AutoDelete bool
 	Internal   bool
+
+	IsUsageDefault bool
 }
 
 type Queue struct {
@@ -42,12 +44,16 @@ type Queue struct {
 	Durable    bool
 	AutoDelete bool
 	Exclusive  bool
+
+	IsUsageDefault bool
 }
 
 type Bind struct {
 	QueueName    string
 	ExchangeName string
 	Key          string
+
+	IsUsageDefault bool
 }
 
 type EventHandler func([]byte) error
@@ -62,28 +68,34 @@ type Consumer struct {
 	run     int32
 }
 
-type Option func(*Session)
+type Option func(*Session) error
 
 func WithDeclare(ex Exchange, q Queue, b Bind) Option {
-	return func(s *Session) {
-		s.declarationSet.Exchange = ex
-		s.declarationSet.Queue = q
-		s.declarationSet.Bind = b
-		s.declarationSet.isUsageDefault = true
-		s.declarationSet.isDecalre = true
+	return func(s *Session) error {
+		if err := s.ExchangeDeclare(ex); err != nil {
+			return err
+		}
+		if err := s.QueueDeclare(q); err != nil {
+			return err
+		}
+		if err := s.QueueBind(b); err != nil {
+			return err
+		}
+
+		return nil
 	}
 }
 
 type Session struct {
 	addr string
 
-	declarationSet struct {
-		isUsageDefault bool
-		isDecalre      bool
-		Exchange       Exchange
-		Queue          Queue
-		Bind           Bind
-	}
+	queues    []Queue
+	exchanges []Exchange
+	binds     []Bind
+
+	defaultExchange *Exchange
+	defaultQueue    *Queue
+	defaultBind     *Bind
 
 	consumers []*Consumer
 
@@ -111,7 +123,10 @@ func New(addr string, opts ...Option) *Session {
 	}
 
 	for _, opt := range opts {
-		opt(session)
+		if err := opt(session); err != nil {
+			log.Printf("failed to Option:%v", err)
+			// TODO
+		}
 	}
 
 	go session.handleReconnect()
@@ -121,8 +136,76 @@ func New(addr string, opts ...Option) *Session {
 	return session
 }
 
-func (session *Session) QueueDeclare(q Queue) *Session {
-	return session
+func (session *Session) QueueDeclare(q Queue) error {
+	session.queues = append(session.queues, q)
+	if q.IsUsageDefault {
+		session.defaultQueue = &q
+	}
+
+	if atomic.LoadInt32(&session.isReady) == 0 {
+		return nil
+	}
+
+	if _, err := session.channel.QueueDeclare(
+		q.Name,       // name
+		q.Durable,    // durable
+		q.AutoDelete, // delete when unused
+		q.Exclusive,  // exclusive
+		false,        // no-wait
+		nil,          // arguments
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (session *Session) ExchangeDeclare(ex Exchange) error {
+	session.exchanges = append(session.exchanges, ex)
+	if ex.IsUsageDefault {
+		session.defaultExchange = &ex
+	}
+
+	if atomic.LoadInt32(&session.isReady) == 0 {
+		return nil
+	}
+
+	if err := session.channel.ExchangeDeclare(
+		ex.Name,       // name
+		ex.Kind,       // type
+		ex.Durable,    // durable
+		ex.AutoDelete, // auto-deleted
+		ex.Internal,   // internal
+		false,         // no-wait
+		nil,           // arguments
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (session *Session) QueueBind(b Bind) error {
+	session.binds = append(session.binds, b)
+	if b.IsUsageDefault {
+		session.defaultBind = &b
+	}
+
+	if atomic.LoadInt32(&session.isReady) == 0 {
+		return nil
+	}
+
+	if err := session.channel.QueueBind(
+		b.QueueName,
+		b.Key,
+		b.ExchangeName,
+		false,
+		nil,
+	); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // handleReconnect will wait for a connection error on
@@ -260,40 +343,43 @@ func (session *Session) init(conn *amqp.Connection) error {
 }
 
 func (session *Session) declare(ch *amqp.Channel) error {
-	if !session.declarationSet.isDecalre {
-		return nil
+	for _, ex := range session.exchanges {
+		if err := ch.ExchangeDeclare(
+			ex.Name,       // name
+			ex.Kind,       // type
+			ex.Durable,    // durable
+			ex.AutoDelete, // auto-deleted
+			ex.Internal,   // internal
+			false,         // no-wait
+			nil,           // arguments
+		); err != nil {
+			return err
+		}
 	}
 
-	if err := ch.ExchangeDeclare(
-		session.declarationSet.Exchange.Name,       // name
-		session.declarationSet.Exchange.Kind,       // type
-		session.declarationSet.Exchange.Durable,    // durable
-		session.declarationSet.Exchange.AutoDelete, // auto-deleted
-		session.declarationSet.Exchange.Internal,   // internal
-		false,                                      // no-wait
-		nil,                                        // arguments
-	); err != nil {
-		return err
+	for _, q := range session.queues {
+		if _, err := ch.QueueDeclare(
+			q.Name,       // name
+			q.Durable,    // durable
+			q.AutoDelete, // delete when unused
+			q.Exclusive,  // exclusive
+			false,        // no-wait
+			nil,          // arguments
+		); err != nil {
+			return err
+		}
 	}
 
-	if _, err := ch.QueueDeclare(
-		session.declarationSet.Queue.Name,       // name
-		session.declarationSet.Queue.Durable,    // durable
-		session.declarationSet.Queue.AutoDelete, // delete when unused
-		session.declarationSet.Queue.Exclusive,  // exclusive
-		false,                                   // no-wait
-		nil,                                     // arguments
-	); err != nil {
-		return err
-	}
-
-	if err := ch.QueueBind(
-		session.declarationSet.Bind.QueueName,
-		session.declarationSet.Bind.Key,
-		session.declarationSet.Bind.ExchangeName,
-		false,
-		nil); err != nil {
-		return err
+	for _, b := range session.binds {
+		if err := ch.QueueBind(
+			b.QueueName,
+			b.Key,
+			b.ExchangeName,
+			false,
+			nil,
+		); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -403,12 +489,12 @@ func (session *Session) Publish(message []byte) error {
 	if atomic.LoadInt32(&session.isReady) == 0 {
 		return ErrNotConnected
 	}
-	if !session.declarationSet.isUsageDefault {
+	if session.defaultExchange == nil || session.defaultBind == nil {
 		return ErrNotSetDefaultExchange
 	}
 
-	exchange := session.declarationSet.Exchange.Name
-	key := session.declarationSet.Bind.Key
+	exchange := session.defaultExchange.Name
+	key := session.defaultBind.Key
 
 	for {
 		err := session.UnsafePublish(message, exchange, key)
@@ -500,10 +586,10 @@ func (session *Session) Stream(c *Consumer) (<-chan amqp.Delivery, error) {
 }
 
 func (session *Session) Subscribe(handler func([]byte) error) error {
-	if !session.declarationSet.isUsageDefault {
+	if session.defaultQueue == nil {
 		return ErrNotSetDefaultQueue
 	}
-	queue := session.declarationSet.Queue.Name
+	queue := session.defaultQueue.Name
 	return session.SubscribeTo(queue, handler)
 }
 
