@@ -92,14 +92,14 @@ func (s *RabbitmqSessionSuite) Test_onePublisher_twoSubscribe() {
 	wg.Add(numOfMsg)
 	var receivedMsg uint64
 
-	err := s.session.Subscribe(func(b []byte) error {
+	err := s.session.Subscribe(func(d pubsub.Delivery) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
 	})
 	s.Require().Nilf(err, "failed to Subscribe1")
 
-	err = s.session.Subscribe(func(b []byte) error {
+	err = s.session.Subscribe(func(d pubsub.Delivery) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
@@ -142,14 +142,14 @@ func (s *RabbitmqSessionSuite) Test_reconnect_whilePublishingMsgs() {
 	wg.Add(numOfMsg)
 	var receivedMsg uint64
 
-	err := s.session.Subscribe(func(b []byte) error {
+	err := s.session.Subscribe(func(d pubsub.Delivery) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
 	})
 	s.Require().Nilf(err, "failed to Subscribe1")
 
-	err = s.session.Subscribe(func(b []byte) error {
+	err = s.session.Subscribe(func(d pubsub.Delivery) error {
 		atomic.AddUint64(&receivedMsg, 1)
 		wg.Done()
 		return nil
@@ -180,7 +180,7 @@ func (s *RabbitmqSessionSuite) Test_reconnect_whileReceivingMsgs() {
 	wg.Add(numOfMsg)
 	var receivedMsg uint64
 
-	err := s.session.Subscribe(func(b []byte) error {
+	err := s.session.Subscribe(func(d pubsub.Delivery) error {
 		atomic.AddUint64(&receivedMsg, 1)
 
 		if atomic.LoadUint64(&receivedMsg) == uint64(numOfMsg/2) {

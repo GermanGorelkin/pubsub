@@ -56,7 +56,14 @@ type Bind struct {
 	IsUsageDefault bool
 }
 
-type EventHandler func([]byte) error
+type Delivery struct {
+	Exchange   string
+	RoutingKey string
+
+	Body []byte
+}
+
+type EventHandler func(Delivery) error
 
 type Consumer struct {
 	Name      string
@@ -448,11 +455,19 @@ func (session *Session) handleDelivery(d amqp.Delivery, handler EventHandler) {
 		}
 	}()
 
-	if err := handler(d.Body); err == nil {
+	if err := handler(convertDelivery(d)); err == nil {
 		_ = d.Ack(false)
 	} else {
 		log.Printf("Failed to handler msg:%v", err)
 		_ = d.Nack(false, true)
+	}
+}
+
+func convertDelivery(d amqp.Delivery) Delivery {
+	return Delivery{
+		Exchange:   d.Exchange,
+		RoutingKey: d.RoutingKey,
+		Body:       d.Body,
 	}
 }
 
@@ -585,7 +600,7 @@ func (session *Session) Stream(c *Consumer) (<-chan amqp.Delivery, error) {
 	)
 }
 
-func (session *Session) Subscribe(handler func([]byte) error) error {
+func (session *Session) Subscribe(handler func(Delivery) error) error {
 	if session.defaultQueue == nil {
 		return ErrNotSetDefaultQueue
 	}
@@ -593,7 +608,7 @@ func (session *Session) Subscribe(handler func([]byte) error) error {
 	return session.SubscribeTo(queue, handler)
 }
 
-func (session *Session) SubscribeTo(queue string, handler func([]byte) error) error {
+func (session *Session) SubscribeTo(queue string, handler func(Delivery) error) error {
 	cons := &Consumer{
 		Handler:   handler,
 		QueueName: queue,
